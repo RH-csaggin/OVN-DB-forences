@@ -62,14 +62,15 @@ ntool_clean
 Performs comprehensive flow analysis for a specific pod IP or pod name across OVN databases.
 
 **Features:**
-- Analyzes SNAT flows
-- Checks EgressIP configurations
-- Examines Service Load Balancer flows
-- Traces node and cluster routing
-- Validates external connectivity flows
-- Reviews ACL and security policies
-- Tests CoreDNS connectivity
-- Supports pod name resolution
+- Analyzes SNAT flows and NAT configurations
+- Checks EgressIP NAT rules and reroute policies
+- Examines Service Load Balancer flows and backends
+- Traces node routing (logical switch ports, port bindings, chassis)
+- Validates cluster routing (router policies, static routes)
+- Analyzes external connectivity and gateway flows
+- Reviews ACL configurations, security policies, and port groups
+- Tests CoreDNS service configuration and connectivity
+- Supports pod name resolution (namespace/podname format)
 - Search mode for finding pods by partial name
 
 **Usage:**
@@ -82,16 +83,6 @@ Performs comprehensive flow analysis for a specific pod IP or pod name across OV
 ./ovn-flow-check ./leader_nbdb ./leader_sbdb --search ovnkube-node
 ./ovn-flow-check ./leader_nbdb ./leader_sbdb --search my-app podman
 ```
-
-**Analysis includes:**
-- Node routing (LSP, port bindings, chassis)
-- Cluster routing (router policies, static routes)
-- SNAT flow configuration
-- EgressIP NAT rules and reroute policies
-- Service load balancer backends
-- External gateway flows
-- ACLs and port groups
-- CoreDNS service configuration
 
 ### 4. `ovn-flow-check-all`
 Processes all OVN databases from a directory one pair at a time and performs comprehensive flow checks.
