@@ -1,0 +1,1212 @@
+#!/bin/bash
+set -euo pipefail
+source ../utils
+
+USAGE="$(basename "$0")"
+
+description() {
+    echo "Process all OVN databases one pair at a time and perform comprehensive flow checks across all databases"
+}
+
+help () {
+    echo "Mount all OVN databases from a directory and perform comprehensive flow checks for a given pod IP or name.
+This script will analyze across ALL OVN databases:
+  - SNAT flows
+  - EgressIP flows
+  - Service Load Balancer flows
+  - Traffic routing within the node
+  - Traffic routing within the cluster
+  - External connection flows
+  - CoreDNS connectivity
+
+The script processes databases ONE PAIR AT A TIME (northbound + southbound for each host) to minimize
+resource usage. Each pair is started, analyzed, and cleaned up before moving to the next pair.
+This is especially useful when dealing with many database files (100+ files).
+
+You can also search for pods by partial name to find all OVN references across all databases.
+
+ATTENTION! For clustered dbs: dbs will be converted from cluster to standalone format
+as this is the only way to run dbs from gathered data. Db UUIDs will be preserved.
+
+ATTENTION! This is a local command, can't be used with must-gather.
+
+Usage:
+  $USAGE [--verbose] db_directory pod_ip_or_name [{docker,podman}]
+  $USAGE [--verbose] db_directory --search partial_pod_name [{docker,podman}]
+
+Parameters:
+  --verbose: enable verbose output for debugging
+  db_directory: directory containing database files from must-gather
+  pod_ip_or_name: IP address or pod name (format: namespace/podname) to analyze
+  --search: search for pods matching a partial name and show all OVN references across all DBs
+  {docker,podman}: choose container engine to use. Default is docker
+
+Examples:
+  $USAGE ./network_logs/dbs 10.128.0.45
+  $USAGE ./network_logs/dbs openshift-ovn-kubernetes/ovnkube-node-abc123
+  $USAGE ./network_logs/dbs --search ovnkube-node
+  $USAGE --verbose ./network_logs/dbs --search my-app podman
+"
+}
+
+CONTAINER_NAME_PREFIX='ovn_flow_check'
+declare -a NB_DB_FILES
+declare -a NB_DB_HOSTS
+declare -a SB_DB_FILES
+declare -a SB_DB_HOSTS
+CURRENT_NB_CONTAINER=""
+CURRENT_SB_CONTAINER=""
+VERBOSE=false
+
+get_db_host() {
+    local DB_TYPE="$1"
+    local DB_FILE="$2"
+
+    local TEMP_DB_FILE=$(mktemp -t ovn_flow_check_all_XXXXXX)
+    grep "${DB_TYPE}B_Global" ${DB_FILE} | grep '"name","' | tail -1 > ${TEMP_DB_FILE}
+
+    local HOST=""
+    case "${DB_TYPE}" in
+       S) HOST=$(jq -r '.SB_Global[] | .options | .[1][] | select(.[0] == "name") | .[1]' ${TEMP_DB_FILE} 2>/dev/null || true) ;;
+       N) HOST=$(jq -r '.NB_Global[] | .options | .[1][] | select(.[0] == "name") | .[1]' ${TEMP_DB_FILE} 2>/dev/null || true) ;;
+       *) echo "ERROR: Invalid DB_TYPE: ${DB_TYPE}" >&2 ; exit 1 ;;
+    esac
+
+    if [ -z "$HOST" ]; then
+      # Try alternative extraction method
+      HOST=$(basename "$DB_FILE" | sed 's/_[ns]bdb$//' | sed 's/^.*_//')
+      if [ -z "$HOST" ]; then
+        echo "ERROR: Unable to determine hostname from OVN database ${DB_TYPE} ${DB_FILE}" >&2
+        exit 1
+      fi
+    fi
+
+    rm -f ${TEMP_DB_FILE}
+    echo ${HOST}
+}
+
+clean_up_current_containers() {
+    if [ -n "$CURRENT_NB_CONTAINER" ]; then
+        $CONTAINER_ENGINE stop "$CURRENT_NB_CONTAINER" 2>/dev/null || true
+        $CONTAINER_ENGINE rm "$CURRENT_NB_CONTAINER" 2>/dev/null || true
+        CURRENT_NB_CONTAINER=""
+    fi
+    if [ -n "$CURRENT_SB_CONTAINER" ]; then
+        $CONTAINER_ENGINE stop "$CURRENT_SB_CONTAINER" 2>/dev/null || true
+        $CONTAINER_ENGINE rm "$CURRENT_SB_CONTAINER" 2>/dev/null || true
+        CURRENT_SB_CONTAINER=""
+    fi
+}
+
+clean_up_all() {
+    echo ""
+    echo "CLEANUP - Stopping any remaining containers..."
+    clean_up_current_containers
+    # Clean up any leftover containers with our prefix
+    local leftover=$($CONTAINER_ENGINE ps -a --filter "name=${CONTAINER_NAME_PREFIX}_*" -q 2>/dev/null || true)
+    if [ -n "$leftover" ]; then
+        echo "$leftover" | xargs $CONTAINER_ENGINE stop 2>/dev/null || true
+        echo "$leftover" | xargs $CONTAINER_ENGINE rm 2>/dev/null || true
+    fi
+    echo "Cleanup complete"
+}
+
+start_ovn_db() {
+    local CONTAINER_NAME="$1"
+    local DB_FILE="$2"
+    local DB_TYPE="$3"
+
+    if $CONTAINER_ENGINE ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        $CONTAINER_ENGINE stop "${CONTAINER_NAME}" 2>/dev/null || true
+        $CONTAINER_ENGINE rm "${CONTAINER_NAME}" 2>/dev/null || true
+    fi
+
+    local CONTAINER=$($CONTAINER_ENGINE run --arch=amd64 -t -d --name "${CONTAINER_NAME}" \
+        --entrypoint /bin/bash quay.io/openshift/origin-ovn-kubernetes:latest)
+
+    # Track current containers
+    if [ "$DB_TYPE" = "n" ]; then
+        CURRENT_NB_CONTAINER="$CONTAINER_NAME"
+    else
+        CURRENT_SB_CONTAINER="$CONTAINER_NAME"
+    fi
+
+    $CONTAINER_ENGINE exec $CONTAINER mkdir -p "/etc/ovn"
+    local COPIED_DB="/etc/ovn/copied_db"
+    $CONTAINER_ENGINE cp "${DB_FILE}" $CONTAINER:$COPIED_DB >/dev/null
+    local FINAL_DB="/etc/ovn/ovn${DB_TYPE}b_db.db"
+
+    $CONTAINER_ENGINE exec $CONTAINER /bin/bash -c "ovsdb-tool db-is-clustered ${COPIED_DB}" 2>/dev/null && {
+        $CONTAINER_ENGINE exec $CONTAINER /bin/bash -c "ovsdb-tool cluster-to-standalone ${FINAL_DB} ${COPIED_DB}" >/dev/null
+    } || {
+        $CONTAINER_ENGINE exec $CONTAINER /bin/bash -c "cp ${COPIED_DB} ${FINAL_DB}" >/dev/null
+    }
+
+    $CONTAINER_ENGINE exec $CONTAINER /usr/share/ovn/scripts/ovn-ctl run_${DB_TYPE}b_ovsdb >/dev/null 2>&1 &
+}
+
+check_ovn_db() {
+    local CONTAINER_NAME="$1"
+    local DB_TYPE="$2"
+
+    local i=1
+    until $CONTAINER_ENGINE exec $CONTAINER_NAME /bin/bash -c "ovn-${DB_TYPE}bctl --no-leader-only show" > /dev/null 2>&1; do
+        sleep 1
+        ((i++)) && ((i==30)) && echo "WARNING: ${CONTAINER_NAME} database not responding" && return 1
+    done
+    return 0
+}
+
+scan_and_organize_databases() {
+    local DB_DIR="$1"
+
+    echo "Scanning for database files in $DB_DIR..."
+    echo ""
+
+    for DB_FILE in "${DB_DIR}"/*; do
+        [ ! -f "$DB_FILE" ] && continue
+
+        local CURR_DB_FILE_TYPE=$(get_db_type "${DB_FILE}")
+        local FILE_NAME=$(basename "${DB_FILE}")
+
+        case "${CURR_DB_FILE_TYPE}" in
+            n)
+                local HOST=$(get_db_host N ${DB_FILE})
+                NB_DB_FILES+=("${DB_FILE}")
+                NB_DB_HOSTS+=("$HOST")
+                echo "Found northbound DB: $FILE_NAME -> Host: $HOST"
+                ;;
+            s)
+                local HOST=$(get_db_host S ${DB_FILE})
+                SB_DB_FILES+=("${DB_FILE}")
+                SB_DB_HOSTS+=("$HOST")
+                echo "Found southbound DB: $FILE_NAME -> Host: $HOST"
+                ;;
+            *)
+                log_verbose "Skipping unknown file: ${FILE_NAME}"
+                ;;
+        esac
+    done
+
+    if [ ${#NB_DB_FILES[@]} -eq 0 ] && [ ${#SB_DB_FILES[@]} -eq 0 ]; then
+        echo "ERROR: No OVN database files found in ${DB_DIR}" >&2
+        exit 1
+    fi
+
+    echo ""
+    echo "Found ${#NB_DB_FILES[@]} northbound and ${#SB_DB_FILES[@]} southbound databases"
+    echo ""
+    echo "=== DATABASE FILE MAPPING ==="
+
+    # Get unique hosts
+    local unique_hosts=($(get_all_unique_hosts))
+
+    for host in "${unique_hosts[@]}"; do
+        echo ""
+        echo "Host: $host"
+
+        # Find matching NB file
+        for ((i = 0; i < ${#NB_DB_HOSTS[@]}; i++)); do
+            if [ "${NB_DB_HOSTS[${i}]}" = "$host" ]; then
+                echo "  NB: $(basename "${NB_DB_FILES[${i}]}")"
+                break
+            fi
+        done
+
+        # Find matching SB file
+        for ((i = 0; i < ${#SB_DB_HOSTS[@]}; i++)); do
+            if [ "${SB_DB_HOSTS[${i}]}" = "$host" ]; then
+                echo "  SB: $(basename "${SB_DB_FILES[${i}]}")"
+                break
+            fi
+        done
+    done
+    echo ""
+}
+
+start_database_pair() {
+    local host="$1"
+    local nb_file="$2"
+    local sb_file="$3"
+
+    echo ""
+    echo "Starting database pair for host: $host"
+
+    local safe_host=$(sanitize_hostname "$host")
+
+    # Start northbound database
+    if [ -n "$nb_file" ]; then
+        local nb_container="${CONTAINER_NAME_PREFIX}_nb_${safe_host}"
+        echo "  Northbound DB file: $(basename "$nb_file")"
+        echo -n "  Starting northbound DB... "
+        start_ovn_db "$nb_container" "$nb_file" "n"
+        echo "done"
+
+        echo -n "  Waiting for northbound DB... "
+        if check_ovn_db "$nb_container" "n"; then
+            echo "ready"
+        else
+            echo "FAILED"
+            return 1
+        fi
+    fi
+
+    # Start southbound database
+    if [ -n "$sb_file" ]; then
+        local sb_container="${CONTAINER_NAME_PREFIX}_sb_${safe_host}"
+        echo "  Southbound DB file: $(basename "$sb_file")"
+        echo -n "  Starting southbound DB... "
+        start_ovn_db "$sb_container" "$sb_file" "s"
+        echo "done"
+
+        echo -n "  Waiting for southbound DB... "
+        if check_ovn_db "$sb_container" "s"; then
+            echo "ready"
+        else
+            echo "FAILED"
+            return 1
+        fi
+    fi
+
+    echo "Database pair ready for $host"
+    return 0
+}
+
+get_database_file_for_host() {
+    local host="$1"
+    local db_type="$2"
+
+    if [ "$db_type" = "n" ]; then
+        for ((i = 0; i < ${#NB_DB_HOSTS[@]}; i++)); do
+            if [ "${NB_DB_HOSTS[${i}]}" = "$host" ]; then
+                echo "${NB_DB_FILES[${i}]}"
+                return 0
+            fi
+        done
+    else
+        for ((i = 0; i < ${#SB_DB_HOSTS[@]}; i++)); do
+            if [ "${SB_DB_HOSTS[${i}]}" = "$host" ]; then
+                echo "${SB_DB_FILES[${i}]}"
+                return 0
+            fi
+        done
+    fi
+    return 1
+}
+
+get_all_unique_hosts() {
+    # Get unique hosts from both NB and SB
+    local all_hosts=()
+
+    # Add NB hosts if array is not empty
+    [ ${#NB_DB_HOSTS[@]} -gt 0 ] && all_hosts+=("${NB_DB_HOSTS[@]}")
+
+    # Add SB hosts if array is not empty
+    [ ${#SB_DB_HOSTS[@]} -gt 0 ] && all_hosts+=("${SB_DB_HOSTS[@]}")
+
+    # Return unique sorted hosts
+    if [ ${#all_hosts[@]} -gt 0 ]; then
+        printf '%s\n' "${all_hosts[@]}" | sort -u
+    fi
+}
+
+log_verbose() {
+    if [ "$VERBOSE" = true ]; then
+        echo "[VERBOSE] $*" >&2
+    fi
+}
+
+show_command() {
+    local command="$1"
+    echo ""
+    echo "┌─────────────────────────────────────────────────────────────────────────────"
+    echo "│ Command: $command"
+    echo "└─────────────────────────────────────────────────────────────────────────────"
+}
+
+run_check_on_container() {
+    local container="$1"
+    local command="$2"
+
+    if [ "$VERBOSE" = true ]; then
+        log_verbose "Running: $command"
+        $CONTAINER_ENGINE exec "$container" /bin/bash -c "$command" 2>&1 || true
+    else
+        $CONTAINER_ENGINE exec "$container" /bin/bash -c "$command" 2>/dev/null || true
+    fi
+}
+
+sanitize_hostname() {
+    local hostname="$1"
+    # Replace dots, colons, and other special chars with underscores for container names
+    echo "$hostname" | tr '.:-' '___'
+}
+
+get_db_files_for_host() {
+    local host="$1"
+    local output=""
+
+    # Find matching NB file
+    for ((i = 0; i < ${#NB_DB_HOSTS[@]}; i++)); do
+        if [ "${NB_DB_HOSTS[${i}]}" = "$host" ]; then
+            output="NB: $(basename "${NB_DB_FILES[${i}]}")"
+            break
+        fi
+    done
+
+    # Find matching SB file
+    for ((i = 0; i < ${#SB_DB_HOSTS[@]}; i++)); do
+        if [ "${SB_DB_HOSTS[${i}]}" = "$host" ]; then
+            if [ -n "$output" ]; then
+                output="$output, SB: $(basename "${SB_DB_FILES[${i}]}")"
+            else
+                output="SB: $(basename "${SB_DB_FILES[${i}]}")"
+            fi
+            break
+        fi
+    done
+
+    echo "$output"
+}
+
+check_pod_ip_across_all_dbs() {
+    local pod_ip="$1"
+    local pod_name="${2:-}"
+
+    # Get unique hosts
+    local unique_hosts=($(get_all_unique_hosts))
+    local total_hosts=${#unique_hosts[@]}
+    local current=0
+
+    # Track summary statistics
+    declare -a hosts_with_pod
+    declare -a hosts_without_pod
+    declare -a hosts_failed
+
+    for host in "${unique_hosts[@]}"; do
+        current=$((current + 1))
+        echo ""
+        echo "###############################################################################"
+        if [ -n "$pod_name" ]; then
+            echo "# CHECKING POD: $pod_name (IP: $pod_ip) ON HOST: $host [$current/$total_hosts]"
+        else
+            echo "# CHECKING POD IP: $pod_ip ON HOST: $host [$current/$total_hosts]"
+        fi
+        echo "# DB Files: $(get_db_files_for_host "$host")"
+        echo "###############################################################################"
+
+        # Get database files for this host
+        local nb_file=$(get_database_file_for_host "$host" "n" || echo "")
+        local sb_file=$(get_database_file_for_host "$host" "s" || echo "")
+
+        if [ -z "$nb_file" ] && [ -z "$sb_file" ]; then
+            echo "WARNING: No databases found for host $host"
+            continue
+        fi
+
+        # Start the database pair for this host
+        if ! start_database_pair "$host" "$nb_file" "$sb_file"; then
+            echo "ERROR: Failed to start databases for host $host, skipping..."
+            hosts_failed+=("$host")
+            clean_up_current_containers
+            continue
+        fi
+
+        # Get the container names
+        local safe_host=$(sanitize_hostname "$host")
+        local nb_container=""
+        local sb_container=""
+        [ -n "$nb_file" ] && nb_container="${CONTAINER_NAME_PREFIX}_nb_${safe_host}"
+        [ -n "$sb_file" ] && sb_container="${CONTAINER_NAME_PREFIX}_sb_${safe_host}"
+
+        # Check if pod exists on this host
+        local pod_found=false
+        if [ -n "$nb_container" ]; then
+            local lsp_check=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find logical_switch_port" | grep "$pod_ip" || true)
+            [ -n "$lsp_check" ] && pod_found=true
+        fi
+
+        if [ "$pod_found" = true ]; then
+            hosts_with_pod+=("$host")
+        else
+            hosts_without_pod+=("$host")
+        fi
+
+        # Run all checks
+        check_node_routing_all "$pod_ip" "$nb_container" "$sb_container" "$host"
+        check_cluster_routing_all "$pod_ip" "$nb_container" "$sb_container" "$host"
+        check_snat_flows_all "$pod_ip" "$nb_container" "$sb_container" "$host"
+        check_egressip_flows_all "$pod_ip" "$nb_container" "$sb_container" "$host"
+        check_service_lb_flows_all "$pod_ip" "$nb_container" "$sb_container" "$host"
+        check_external_connectivity_all "$pod_ip" "$nb_container" "$sb_container" "$host"
+        check_acls_and_security_all "$pod_ip" "$nb_container" "$sb_container" "$host"
+        check_coredns_connectivity_all "$pod_ip" "$nb_container" "$sb_container" "$host"
+
+        # Clean up this pair before moving to the next
+        echo ""
+        echo "Cleaning up containers for $host..."
+        clean_up_current_containers
+    done
+
+    echo ""
+    echo "###############################################################################"
+    echo "# FLOW ANALYSIS COMPLETE ACROSS ALL DATABASES"
+    echo "###############################################################################"
+    echo ""
+    echo "=== SUMMARY ==="
+    echo "Total hosts scanned: $total_hosts"
+    echo ""
+    echo "Hosts where pod was found: ${#hosts_with_pod[@]}"
+    if [ ${#hosts_with_pod[@]} -gt 0 ]; then
+        for host in "${hosts_with_pod[@]}"; do
+            echo "  - $host ($(get_db_files_for_host "$host"))"
+        done
+    fi
+    echo ""
+    echo "Hosts where pod was NOT found: ${#hosts_without_pod[@]}"
+    if [ ${#hosts_without_pod[@]} -gt 0 ]; then
+        for host in "${hosts_without_pod[@]}"; do
+            echo "  - $host ($(get_db_files_for_host "$host"))"
+        done
+    fi
+    if [ ${#hosts_failed[@]} -gt 0 ]; then
+        echo ""
+        echo "Hosts that failed to start: ${#hosts_failed[@]}"
+        for host in "${hosts_failed[@]}"; do
+            echo "  - $host ($(get_db_files_for_host "$host"))"
+        done
+    fi
+    echo ""
+}
+
+check_node_routing_all() {
+    local pod_ip="$1"
+    local nb_container="$2"
+    local sb_container="$3"
+    local host="$4"
+
+    echo ""
+    echo "==============================================================================="
+    echo "  NODE ROUTING ANALYSIS (Host: $host)"
+    echo "==============================================================================="
+
+    show_command "ovn-nbctl --no-leader-only find logical_switch_port | grep -B10 -A3 $pod_ip"
+    local lsp_info=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find logical_switch_port" | grep -B10 -A3 "$pod_ip" || true)
+
+    if [ -n "$lsp_info" ]; then
+        echo "Found logical switch port:"
+        echo "$lsp_info"
+
+        # Get the port name
+        local lsp_name=$(echo "$lsp_info" | grep "^name" | head -1 | awk '{print $3}' | tr -d '"')
+
+        if [ -n "$lsp_name" ]; then
+            echo ""
+            echo "--- Full LSP Details for $lsp_name ---"
+            show_command "ovn-nbctl --no-leader-only list logical_switch_port \"$lsp_name\""
+            run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only list logical_switch_port \"$lsp_name\"" || true
+        fi
+
+        show_command "ovn-sbctl --no-leader-only find port_binding | grep -B5 -A5 $pod_ip"
+        local port_binding=$(run_check_on_container "$sb_container" "ovn-sbctl --no-leader-only find port_binding" | grep -B5 -A5 "$pod_ip" || true)
+        if [ -n "$port_binding" ]; then
+            echo ""
+            echo "Port bindings:"
+            echo "$port_binding"
+
+            # Extract chassis binding information
+            local chassis=$(echo "$port_binding" | grep "chassis" | head -1 | awk '{print $NF}' | tr -d '"')
+            if [ -n "$chassis" ]; then
+                echo ""
+                echo "--- Chassis Binding ---"
+                echo "Pod is bound to chassis: $chassis"
+            fi
+        else
+            echo ""
+            echo "╔═══════════════════════════════════════════════════════════════════════════╗"
+            echo "║ ⚠️  WARNING: Pod found in NB but no port binding in SB                    ║"
+            echo "╚═══════════════════════════════════════════════════════════════════════════╝"
+            echo "This may indicate the pod is not properly bound to a chassis."
+        fi
+
+        echo ""
+        echo "Logical flows:"
+        show_command "ovn-sbctl --no-leader-only lflow-list | grep $pod_ip"
+        local flows=$(run_check_on_container "$sb_container" "ovn-sbctl --no-leader-only lflow-list" | grep "$pod_ip" || true)
+        if [ -n "$flows" ]; then
+            echo "$flows"
+        else
+            echo ""
+            echo "╔═══════════════════════════════════════════════════════════════════════════╗"
+            echo "║ ⚠️  WARNING: Pod found in NB but NO FLOWS in SB                           ║"
+            echo "╚═══════════════════════════════════════════════════════════════════════════╝"
+            echo "This indicates a problem:"
+            echo "  • Pod may not be properly bound to a chassis"
+            echo "  • Sync issue between NB and SB databases"
+            echo "  • ovn-controller may not have processed the NB configuration"
+            echo "  • OVN control plane issue"
+        fi
+    else
+        echo "No logical switch port found for $pod_ip on $host"
+    fi
+}
+
+check_cluster_routing_all() {
+    local pod_ip="$1"
+    local nb_container="$2"
+    local sb_container="$3"
+    local host="$4"
+
+    echo ""
+    echo "==============================================================================="
+    echo "  CLUSTER ROUTING ANALYSIS (Host: $host)"
+    echo "==============================================================================="
+
+    # Get subnet for this IP
+    local subnet=$(echo "$pod_ip" | cut -d'.' -f1-3)
+
+    show_command "ovn-nbctl --no-leader-only find logical_router_policy | grep -B5 -A5 $pod_ip"
+    local policies=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find logical_router_policy" | grep -B5 -A5 "$pod_ip" || true)
+
+    if [ -n "$policies" ]; then
+        echo "Router policies:"
+        echo "$policies"
+    else
+        echo "No specific routing policies found for $pod_ip"
+        echo "Checking policies for subnet ${subnet}.0/24..."
+        show_command "ovn-nbctl --no-leader-only find logical_router_policy | grep -B5 -A5 $subnet"
+        run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find logical_router_policy" | grep -B5 -A5 "$subnet" || echo "No policies found for this IP's subnet"
+    fi
+
+    show_command "ovn-nbctl --no-leader-only find logical_router_static_route | grep -B3 -A3 $pod_ip"
+    local routes=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find logical_router_static_route" | grep -B3 -A3 "$pod_ip" || true)
+    if [ -n "$routes" ]; then
+        echo ""
+        echo "Static routes:"
+        echo "$routes"
+    else
+        show_command "ovn-nbctl --no-leader-only find logical_router_static_route | grep -B3 -A3 $subnet"
+        run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find logical_router_static_route" | grep -B3 -A3 "$subnet" || echo "No static routes found for this IP or subnet"
+    fi
+
+    # Check routing flows for this specific IP in southbound
+    echo ""
+    echo "--- Routing Logical Flows for $pod_ip (Southbound) ---"
+    show_command "ovn-sbctl --no-leader-only lflow-list | grep $pod_ip | grep -i 'route\\|next'"
+    run_check_on_container "$sb_container" "ovn-sbctl --no-leader-only lflow-list" | grep "$pod_ip" | grep -i "route\|next" || echo "No routing flows found for this specific IP"
+}
+
+check_snat_flows_all() {
+    local pod_ip="$1"
+    local nb_container="$2"
+    local sb_container="$3"
+    local host="$4"
+
+    echo ""
+    echo "==============================================================================="
+    echo "  SNAT FLOW ANALYSIS (Host: $host)"
+    echo "==============================================================================="
+
+    echo "--- NAT Rules for $pod_ip (Northbound) ---"
+    show_command "ovn-nbctl --no-leader-only find NAT logical_ip=\"$pod_ip\""
+    local nat_rules=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find NAT logical_ip=\"$pod_ip\"" || true)
+
+    if [ -n "$nat_rules" ]; then
+        echo "$nat_rules"
+    else
+        local subnet=$(echo "$pod_ip" | cut -d'.' -f1-3)
+        echo "Checking SNAT rules for subnet ${subnet}.0/24..."
+        show_command "ovn-nbctl --no-leader-only find NAT type=snat | grep -B2 -A2 $subnet"
+        local subnet_nats=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find NAT type=snat" | grep -B2 -A2 "$subnet" || true)
+        if [ -n "$subnet_nats" ]; then
+            echo "$subnet_nats"
+        else
+            echo "No SNAT rules found for $pod_ip or subnet"
+        fi
+    fi
+
+    # Check logical flows related to SNAT for this specific IP
+    echo ""
+    echo "--- Logical Flows with SNAT for $pod_ip (Southbound) ---"
+    show_command "ovn-sbctl --no-leader-only lflow-list | grep -i 'snat\\|ct_snat' | grep $pod_ip"
+    run_check_on_container "$sb_container" "ovn-sbctl --no-leader-only lflow-list" | grep -i "snat\|ct_snat" | grep "$pod_ip" || echo "No SNAT logical flows found for this specific IP"
+}
+
+check_egressip_flows_all() {
+    local pod_ip="$1"
+    local nb_container="$2"
+    local sb_container="$3"
+    local host="$4"
+
+    echo ""
+    echo "==============================================================================="
+    echo "  EGRESSIP FLOW ANALYSIS (Host: $host)"
+    echo "==============================================================================="
+
+    local subnet=$(echo "$pod_ip" | cut -d'.' -f1-3)
+
+    echo "--- EgressIP NAT Rules for $pod_ip ---"
+    show_command "ovn-nbctl --no-leader-only find NAT type=snat | grep -B10 -A10 $pod_ip"
+    local egressip_nats=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find NAT type=snat" | grep -B10 -A10 "$pod_ip" || true)
+
+    if [ -n "$egressip_nats" ]; then
+        echo "$egressip_nats"
+
+        echo ""
+        echo "--- Checking if above NATs are EgressIP (have external_ids) ---"
+        show_command "ovn-nbctl --no-leader-only list NAT | grep -B15 -A5 'external_ids.*name' | grep -B15 -A5 $pod_ip"
+        local egressip_labeled=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only list NAT" | grep -B15 -A5 "external_ids.*name" | grep -B15 -A5 "$pod_ip" || true)
+        if [ -n "$egressip_labeled" ]; then
+            echo "$egressip_labeled"
+        else
+            echo "NAT rules found but not labeled as EgressIP"
+        fi
+    else
+        echo "No NAT rules found for $pod_ip, checking subnet ${subnet}.0/24..."
+        show_command "ovn-nbctl --no-leader-only find NAT type=snat | grep -B10 -A10 $subnet"
+        run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find NAT type=snat" | grep -B10 -A10 "$subnet" || echo "No EgressIP NAT rules found for this IP or subnet"
+    fi
+
+    echo ""
+    echo "--- EgressIP Reroute Policies for $pod_ip ---"
+    show_command "ovn-nbctl --no-leader-only find logical_router_policy | grep -B5 -A5 $pod_ip | grep -B5 -A5 reroute"
+    local reroute_policies=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find logical_router_policy" | grep -B5 -A5 "$pod_ip" | grep -B5 -A5 "reroute" || true)
+    if [ -n "$reroute_policies" ]; then
+        echo "$reroute_policies"
+    else
+        echo "No reroute policies found for this specific IP"
+        echo "Checking for subnet-level policies..."
+        show_command "ovn-nbctl --no-leader-only find logical_router_policy | grep -B5 -A5 $subnet | grep -B5 -A5 reroute"
+        run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find logical_router_policy" | grep -B5 -A5 "$subnet" | grep -B5 -A5 "reroute" || echo "No EgressIP reroute policies found"
+    fi
+
+    # Check for EgressIP-related flows in southbound specific to this IP
+    echo ""
+    echo "--- EgressIP Logical Flows for $pod_ip (Southbound) ---"
+    show_command "ovn-sbctl --no-leader-only lflow-list | grep $pod_ip | grep -i 'reroute\\|pkt.mark'"
+    run_check_on_container "$sb_container" "ovn-sbctl --no-leader-only lflow-list" | grep "$pod_ip" | grep -i "reroute\|pkt.mark" || echo "No EgressIP logical flows found for this specific IP"
+
+    # Check EgressIP objects if supported
+    echo ""
+    echo "--- EgressIP Objects affecting $pod_ip ---"
+    show_command "ovn-nbctl --no-leader-only list EgressIP | grep -B10 -A10 $pod_ip"
+    local egressip_objs=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only list EgressIP" | grep -B10 -A10 "$pod_ip" || true)
+    if [ -n "$egressip_objs" ]; then
+        echo "$egressip_objs"
+    else
+        echo "No EgressIP objects found for this IP (or not supported in this OVN version)"
+    fi
+}
+
+check_service_lb_flows_all() {
+    local pod_ip="$1"
+    local nb_container="$2"
+    local sb_container="$3"
+    local host="$4"
+
+    echo ""
+    echo "==============================================================================="
+    echo "  SERVICE LOAD BALANCER ANALYSIS (Host: $host)"
+    echo "==============================================================================="
+
+    echo "--- Load Balancers with $pod_ip as backend or VIP ---"
+    show_command "ovn-nbctl --no-leader-only find load_balancer | grep -B10 -A10 $pod_ip"
+    local lb_found=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find load_balancer" | grep -B10 -A10 "$pod_ip" || true)
+
+    if [ -n "$lb_found" ]; then
+        echo "$lb_found"
+
+        # Get the load balancer UUIDs that match
+        echo ""
+        echo "--- Detailed LB configuration for $pod_ip ---"
+        local lb_uuids=$(echo "$lb_found" | grep "^_uuid" | awk '{print $3}')
+        for uuid in $lb_uuids; do
+            show_command "ovn-nbctl --no-leader-only list load_balancer $uuid"
+            run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only list load_balancer \"$uuid\"" || true
+        done
+    else
+        echo "Pod IP not found as LB backend or VIP"
+    fi
+
+    # Check logical flows for load balancing specific to this IP
+    echo ""
+    echo "--- Logical Flows with LB actions for $pod_ip (Southbound) ---"
+    show_command "ovn-sbctl --no-leader-only lflow-list | grep -i ct_lb | grep $pod_ip"
+    run_check_on_container "$sb_container" "ovn-sbctl --no-leader-only lflow-list" | grep -i "ct_lb" | grep "$pod_ip" || echo "No LB logical flows found for this specific IP"
+}
+
+check_external_connectivity_all() {
+    local pod_ip="$1"
+    local nb_container="$2"
+    local sb_container="$3"
+    local host="$4"
+
+    echo ""
+    echo "==============================================================================="
+    echo "  EXTERNAL CONNECTIVITY ANALYSIS (Host: $host)"
+    echo "==============================================================================="
+
+    local subnet=$(echo "$pod_ip" | cut -d'.' -f1-3)
+
+    echo "--- NAT Rules for External Traffic ($pod_ip) ---"
+    show_command "ovn-nbctl --no-leader-only find NAT type=snat external_ip!=null | grep -B10 -A5 $pod_ip"
+    local nat_external=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find NAT type=snat external_ip!=null" | grep -B10 -A5 "$pod_ip" || true)
+
+    if [ -n "$nat_external" ]; then
+        echo "$nat_external"
+    else
+        echo "No direct NAT rules found for $pod_ip, checking subnet..."
+        show_command "ovn-nbctl --no-leader-only find NAT type=snat external_ip!=null | grep -B10 -A5 $subnet"
+        run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find NAT type=snat external_ip!=null" | grep -B10 -A5 "$subnet" || echo "No external NAT rules found for this IP or subnet"
+    fi
+
+    # Find the gateway router(s) relevant to this IP
+    echo ""
+    echo "--- Gateway Router serving $pod_ip ---"
+    # First find which logical switch this IP belongs to
+    local lsp=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find logical_switch_port" | grep -B5 "$pod_ip" | grep "^name" | awk '{print $3}' | tr -d '"' | head -1 || true)
+    if [ -n "$lsp" ]; then
+        echo "Pod is on logical switch port: $lsp"
+        echo "Finding gateway router configuration..."
+        show_command "ovn-nbctl --no-leader-only find logical_router options:chassis!=null | head -20"
+        run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find logical_router options:chassis!=null" | head -20 || true
+    else
+        echo "Could not determine logical switch port for this IP"
+    fi
+
+    # Check logical flows for external connectivity specific to this IP
+    echo ""
+    echo "--- External Gateway Flows for $pod_ip (Southbound) ---"
+    show_command "ovn-sbctl --no-leader-only lflow-list | grep $pod_ip | grep -i 'external\\|gateway\\|nat'"
+    run_check_on_container "$sb_container" "ovn-sbctl --no-leader-only lflow-list" | grep "$pod_ip" | grep -i "external\|gateway\|nat" || echo "No external gateway flows found for this specific IP"
+}
+
+check_acls_and_security_all() {
+    local pod_ip="$1"
+    local nb_container="$2"
+    local sb_container="$3"
+    local host="$4"
+
+    echo ""
+    echo "==============================================================================="
+    echo "  ACL AND SECURITY ANALYSIS (Host: $host)"
+    echo "==============================================================================="
+
+    # Find the logical switch port for this IP first
+    local lsp=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find logical_switch_port" | grep -B5 "$pod_ip" | grep "^name" | awk '{print $3}' | tr -d '"' | head -1 || true)
+
+    echo "--- ACLs mentioning $pod_ip ---"
+    show_command "ovn-nbctl --no-leader-only find ACL | grep -B5 -A5 $pod_ip"
+    local acls=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find ACL" | grep -B5 -A5 "$pod_ip" || true)
+
+    if [ -n "$acls" ]; then
+        echo "$acls"
+    else
+        echo "No ACLs directly mentioning $pod_ip"
+    fi
+
+    # Check port groups containing this pod's port
+    if [ -n "$lsp" ]; then
+        echo ""
+        echo "--- Port Groups containing $lsp ---"
+        show_command "ovn-nbctl --no-leader-only find port_group | grep -B3 -A10 $lsp"
+        local port_groups=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find port_group" | grep -B3 -A10 "$lsp" || true)
+        if [ -n "$port_groups" ]; then
+            echo "$port_groups"
+        else
+            echo "No port groups found containing this port"
+        fi
+
+        # Show ACLs applied to this port's port groups
+        echo ""
+        echo "--- ACLs applied to port groups containing $lsp ---"
+        local pg_uuids=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find port_group" | grep -B3 "$lsp" | grep "^_uuid" | awk '{print $3}' || true)
+        for pg_uuid in $pg_uuids; do
+            echo "Port group $pg_uuid ACLs:"
+            show_command "ovn-nbctl --no-leader-only get port_group $pg_uuid acls"
+            run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only get port_group \"$pg_uuid\" acls" || true
+        done
+    else
+        echo "Could not determine logical switch port for this IP, skipping port group analysis"
+    fi
+}
+
+check_coredns_connectivity_all() {
+    local pod_ip="$1"
+    local nb_container="$2"
+    local sb_container="$3"
+    local host="$4"
+
+    echo ""
+    echo "==============================================================================="
+    echo "  COREDNS CONNECTIVITY ANALYSIS (Host: $host)"
+    echo "==============================================================================="
+
+    # Find CoreDNS service load balancers (port 53 -> 5353)
+    show_command "ovn-nbctl --no-leader-only find load_balancer | grep -B3 -A8 ':53='"
+    local dns_lbs=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find load_balancer" | grep -B3 -A8 ":53=" || true)
+
+    if [ -n "$dns_lbs" ]; then
+        echo "CoreDNS service load balancer (VIP:53 -> backends:5353):"
+        echo "$dns_lbs" | head -20
+
+        # Extract service VIPs and backends
+        local dns_service_ips=$(echo "$dns_lbs" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}:53' | cut -d':' -f1 | sort -u)
+        local dns_backend_ips=$(echo "$dns_lbs" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}:5353' | cut -d':' -f1 | sort -u)
+
+        if [ -n "$dns_service_ips" ]; then
+            echo ""
+            echo "DNS Service VIPs: $(echo $dns_service_ips | tr '\n' ' ')"
+        fi
+        if [ -n "$dns_backend_ips" ]; then
+            echo "DNS Backends (5353): $(echo $dns_backend_ips | tr '\n' ' ')"
+        fi
+
+        # Check ACLs for DNS traffic from this pod
+        echo ""
+        show_command "ovn-nbctl --no-leader-only find ACL | grep -E '(5353|53)' | grep -B3 -A3 $pod_ip"
+        local dns_acls=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find ACL" | grep -E "(5353|53)" | grep -B3 -A3 "$pod_ip" || true)
+        if [ -n "$dns_acls" ]; then
+            echo "DNS-related ACLs:"
+            echo "$dns_acls"
+        fi
+
+        # Check logical flows
+        if [ -n "$sb_container" ]; then
+            show_command "ovn-sbctl --no-leader-only lflow-list | grep $pod_ip | grep -E '(udp|tcp)\\.(dst|src).*(53|5353)'"
+            local dns_flows=$(run_check_on_container "$sb_container" "ovn-sbctl --no-leader-only lflow-list" | grep "$pod_ip" | grep -E "(udp|tcp)\.(dst|src).*(53|5353)" || true)
+            if [ -n "$dns_flows" ]; then
+                echo ""
+                echo "DNS logical flows:"
+                echo "$dns_flows"
+            fi
+        fi
+    else
+        echo "No CoreDNS load balancer found"
+    fi
+}
+
+search_pod_across_all_dbs() {
+    local search_term="$1"
+
+    local unique_hosts=($(get_all_unique_hosts))
+    local total_hosts=${#unique_hosts[@]}
+    local current=0
+
+    # Track summary statistics
+    declare -a hosts_with_results
+    declare -a hosts_without_results
+    declare -a hosts_failed
+
+    for host in "${unique_hosts[@]}"; do
+        current=$((current + 1))
+        echo ""
+        echo "###############################################################################"
+        echo "# SEARCHING FOR: $search_term ON HOST: $host [$current/$total_hosts]"
+        echo "# DB Files: $(get_db_files_for_host "$host")"
+        echo "###############################################################################"
+
+        # Get database files for this host
+        local nb_file=$(get_database_file_for_host "$host" "n" || echo "")
+        local sb_file=$(get_database_file_for_host "$host" "s" || echo "")
+
+        if [ -z "$nb_file" ] && [ -z "$sb_file" ]; then
+            echo "WARNING: No databases found for host $host"
+            continue
+        fi
+
+        # Start the database pair for this host
+        if ! start_database_pair "$host" "$nb_file" "$sb_file"; then
+            echo "ERROR: Failed to start databases for host $host, skipping..."
+            hosts_failed+=("$host")
+            clean_up_current_containers
+            continue
+        fi
+
+        # Get the container names
+        local safe_host=$(sanitize_hostname "$host")
+        local nb_container=""
+        local sb_container=""
+        [ -n "$nb_file" ] && nb_container="${CONTAINER_NAME_PREFIX}_nb_${safe_host}"
+        [ -n "$sb_file" ] && sb_container="${CONTAINER_NAME_PREFIX}_sb_${safe_host}"
+
+        # Track if we found any results on this host
+        local found_results=false
+
+        if [ -n "$nb_container" ]; then
+            echo ""
+            echo "=== Logical Switch Ports ==="
+            show_command "ovn-nbctl --no-leader-only find logical_switch_port external_ids:pod=true | grep -i -B10 -A15 $search_term"
+            local lsps=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find logical_switch_port external_ids:pod=true" | grep -i -B10 -A15 "$search_term" || true)
+
+            if [ -n "$lsps" ]; then
+                echo "$lsps"
+                found_results=true
+            else
+                echo "No matching pods found"
+            fi
+        fi
+
+        if [ -n "$sb_container" ]; then
+            echo ""
+            echo "=== Port Bindings ==="
+            show_command "ovn-sbctl --no-leader-only find port_binding | grep -i -B5 -A10 $search_term"
+            local pbs=$(run_check_on_container "$sb_container" "ovn-sbctl --no-leader-only find port_binding" | grep -i -B5 -A10 "$search_term" || true)
+            if [ -n "$pbs" ]; then
+                echo "$pbs"
+                found_results=true
+            else
+                echo "No matching port bindings found"
+            fi
+        fi
+
+        if [ -n "$nb_container" ]; then
+            echo ""
+            echo "=== NAT Rules ==="
+            show_command "ovn-nbctl --no-leader-only list NAT | grep -i -B5 -A5 $search_term"
+            local nats=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only list NAT" | grep -i -B5 -A5 "$search_term" || true)
+            if [ -n "$nats" ]; then
+                echo "$nats"
+                found_results=true
+            else
+                echo "No matching NAT rules found"
+            fi
+
+            echo ""
+            echo "=== ACLs ==="
+            show_command "ovn-nbctl --no-leader-only find ACL | grep -i -B5 -A5 $search_term"
+            local acls=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find ACL" | grep -i -B5 -A5 "$search_term" || true)
+            if [ -n "$acls" ]; then
+                echo "$acls"
+                found_results=true
+            else
+                echo "No matching ACLs found"
+            fi
+
+            echo ""
+            echo "=== Port Groups ==="
+            show_command "ovn-nbctl --no-leader-only find port_group | grep -i -B5 -A10 $search_term"
+            local pgs=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find port_group" | grep -i -B5 -A10 "$search_term" || true)
+            if [ -n "$pgs" ]; then
+                echo "$pgs"
+                found_results=true
+            else
+                echo "No matching port groups found"
+            fi
+
+            echo ""
+            echo "=== Load Balancers ==="
+            show_command "ovn-nbctl --no-leader-only find load_balancer | grep -i -B5 -A10 $search_term"
+            local lbs=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find load_balancer" | grep -i -B5 -A10 "$search_term" || true)
+            if [ -n "$lbs" ]; then
+                echo "$lbs"
+                found_results=true
+            else
+                echo "No matching load balancers found"
+            fi
+        fi
+
+        # Track summary
+        if [ "$found_results" = true ]; then
+            hosts_with_results+=("$host")
+        else
+            hosts_without_results+=("$host")
+        fi
+
+        # Clean up this pair before moving to the next
+        echo ""
+        echo "Cleaning up containers for $host..."
+        clean_up_current_containers
+    done
+
+    echo ""
+    echo "###############################################################################"
+    echo "# SEARCH COMPLETE ACROSS ALL DATABASES"
+    echo "###############################################################################"
+    echo ""
+    echo "=== SEARCH SUMMARY ==="
+    echo "Total hosts scanned: $total_hosts"
+    echo ""
+    echo "Hosts with matching results: ${#hosts_with_results[@]}"
+    if [ ${#hosts_with_results[@]} -gt 0 ]; then
+        for host in "${hosts_with_results[@]}"; do
+            echo "  - $host ($(get_db_files_for_host "$host"))"
+        done
+    fi
+    echo ""
+    echo "Hosts without matching results: ${#hosts_without_results[@]}"
+    if [ ${#hosts_without_results[@]} -gt 0 ]; then
+        for host in "${hosts_without_results[@]}"; do
+            echo "  - $host ($(get_db_files_for_host "$host"))"
+        done
+    fi
+    if [ ${#hosts_failed[@]} -gt 0 ]; then
+        echo ""
+        echo "Hosts that failed to start: ${#hosts_failed[@]}"
+        for host in "${hosts_failed[@]}"; do
+            echo "  - $host ($(get_db_files_for_host "$host"))"
+        done
+    fi
+    echo ""
+}
+
+resolve_pod_name_to_ip_all() {
+    local pod_identifier="$1"
+    local pod_ip=""
+    local pod_name=""
+
+    # Check if it's an IP address
+    if [[ "$pod_identifier" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$pod_identifier:"
+        return 0
+    fi
+
+    # Try to resolve from any northbound database
+    pod_name="$pod_identifier"
+    echo "Resolving pod name: $pod_name across all databases..." >&2
+
+    local unique_hosts=($(get_all_unique_hosts))
+
+    for host in "${unique_hosts[@]}"; do
+        local nb_file=$(get_database_file_for_host "$host" "n" || echo "")
+
+        if [ -z "$nb_file" ]; then
+            continue
+        fi
+
+        # Start just the northbound database temporarily for resolution
+        local safe_host=$(sanitize_hostname "$host")
+        local nb_container="${CONTAINER_NAME_PREFIX}_nb_${safe_host}_resolve"
+        echo -n "  Checking $host... " >&2
+
+        start_ovn_db "$nb_container" "$nb_file" "n" >/dev/null 2>&1
+
+        if check_ovn_db "$nb_container" "n"; then
+            local search_result=$(run_check_on_container "$nb_container" "ovn-nbctl --no-leader-only find logical_switch_port external_ids:pod=true" | grep -B20 -A5 "$pod_name" || true)
+
+            if [ -n "$search_result" ]; then
+                pod_ip=$(echo "$search_result" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+
+                if [ -n "$pod_ip" ]; then
+                    echo "found!" >&2
+                    echo "Resolved $pod_name to IP: $pod_ip on $host" >&2
+
+                    # Clean up the temporary container
+                    $CONTAINER_ENGINE stop "$nb_container" 2>/dev/null || true
+                    $CONTAINER_ENGINE rm "$nb_container" 2>/dev/null || true
+                    CURRENT_NB_CONTAINER=""
+
+                    echo "$pod_ip:$pod_name"
+                    return 0
+                fi
+            fi
+            echo "not found" >&2
+        else
+            echo "failed to start" >&2
+        fi
+
+        # Clean up this temporary container
+        $CONTAINER_ENGINE stop "$nb_container" 2>/dev/null || true
+        $CONTAINER_ENGINE rm "$nb_container" 2>/dev/null || true
+        CURRENT_NB_CONTAINER=""
+    done
+
+    echo "ERROR: Could not resolve pod name '$pod_name' to an IP address" >&2
+    return 1
+}
+
+main() {
+    # Parse optional --verbose flag
+    if [ "${1:-}" = "--verbose" ]; then
+        VERBOSE=true
+        shift
+        log_verbose "Verbose mode enabled"
+    fi
+
+    if [ $# -lt 2 ]; then
+        echo "ERROR: Insufficient arguments" >&2
+        help
+        exit 1
+    fi
+
+    DB_DIR=$(get_full_path "$1")
+    POD_IDENTIFIER="$2"
+
+    # Validate that DB_DIR exists and is a directory
+    if [ ! -d "$DB_DIR" ]; then
+        echo "ERROR: '$DB_DIR' is not a directory or does not exist" >&2
+        exit 1
+    fi
+
+    # Check if this is a search operation
+    SEARCH_MODE=false
+    if [ "$POD_IDENTIFIER" = "--search" ]; then
+        SEARCH_MODE=true
+        if [ $# -lt 3 ]; then
+            echo "ERROR: --search requires a search term" >&2
+            help
+            exit 1
+        fi
+        SEARCH_TERM="$3"
+        CONTAINER_ENGINE="${4:-docker}"
+    else
+        CONTAINER_ENGINE="${3:-docker}"
+    fi
+
+    # Validate dependencies
+    if ! command -v jq &> /dev/null; then
+        echo "ERROR: jq is not installed. Please install jq to use this script." >&2
+        exit 1
+    fi
+
+    if ! command -v "$CONTAINER_ENGINE" &> /dev/null; then
+        echo "ERROR: Container engine '$CONTAINER_ENGINE' is not installed or not in PATH" >&2
+        exit 1
+    fi
+
+    # Verify container engine is working
+    if ! $CONTAINER_ENGINE ps >/dev/null 2>&1; then
+        echo "ERROR: Container engine '$CONTAINER_ENGINE' is not working properly" >&2
+        echo "       Make sure the daemon is running and you have permissions" >&2
+        exit 1
+    fi
+
+    # Setup cleanup trap
+    trap clean_up_all EXIT INT TERM
+
+    # Scan and organize databases (don't start them yet)
+    scan_and_organize_databases "$DB_DIR"
+
+    # Execute search mode or flow analysis
+    if [ "$SEARCH_MODE" = true ]; then
+        search_pod_across_all_dbs "$SEARCH_TERM"
+    else
+        # Resolve pod name to IP if needed
+        resolved=$(resolve_pod_name_to_ip_all "$POD_IDENTIFIER")
+        if [ $? -ne 0 ]; then
+            echo "ERROR: Failed to resolve pod identifier" >&2
+            exit 1
+        fi
+
+        POD_IP=$(echo "$resolved" | cut -d':' -f1)
+        POD_NAME=$(echo "$resolved" | cut -d':' -f2)
+
+        # Validate IP address format
+        if ! [[ "$POD_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: Invalid IP address format: $POD_IP" >&2
+            exit 1
+        fi
+
+        # Perform flow analysis across all databases (one pair at a time)
+        check_pod_ip_across_all_dbs "$POD_IP" "$POD_NAME"
+    fi
+
+    echo ""
+    echo "Analysis complete! All containers have been cleaned up."
+}
+
+case "${1:-}" in
+  description) description ;;
+  -h|--help) help ;;
+  *) main "$@" ;;
+esac
