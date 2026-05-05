@@ -534,6 +534,73 @@ check_egressip_flows() {
     else
         echo "No EgressIP objects found for this IP (or not supported in this OVN version)"
     fi
+
+    # Detect which node hosts the EgressIP via NAT rules on gateway routers
+    echo ""
+    echo "--- EgressIP Node Assignment (NAT) for $pod_ip ---"
+    show_command "ovn-nbctl --no-leader-only lr-list"
+    local routers=$($CONTAINER_ENGINE exec $CONTAINER ovn-nbctl --no-leader-only lr-list 2>/dev/null || true)
+    local egressip_node_found=false
+    if [ -n "$routers" ]; then
+        while IFS= read -r router_line; do
+            local router_name=$(echo "$router_line" | awk '{print $2}' | tr -d '()')
+            [ -z "$router_name" ] && continue
+            local nat_match=$($CONTAINER_ENGINE exec $CONTAINER ovn-nbctl --no-leader-only lr-nat-list "$router_name" 2>/dev/null | grep "$pod_ip" || true)
+            if [ -n "$nat_match" ]; then
+                show_command "ovn-nbctl --no-leader-only lr-nat-list $router_name | grep $pod_ip"
+                echo "Found NAT rule for $pod_ip on router: $router_name"
+                echo "$nat_match"
+                if [[ "$router_name" == GR_* ]]; then
+                    local egress_node="${router_name#GR_}"
+                    echo "  -> EgressIP is hosted on node: $egress_node"
+                fi
+                egressip_node_found=true
+            fi
+        done <<< "$routers"
+    fi
+    if [ "$egressip_node_found" = false ]; then
+        echo "No EgressIP NAT rules found on any gateway router for $pod_ip"
+    fi
+
+    # Resolve reroute policy nexthops to node names
+    echo ""
+    echo "--- EgressIP Node Assignment (Reroute Policy) for $pod_ip ---"
+    show_command "ovn-nbctl --no-leader-only find logical_router_policy action=reroute | grep -B5 -A5 $pod_ip"
+    local reroute_full=$($CONTAINER_ENGINE exec $CONTAINER ovn-nbctl --no-leader-only find logical_router_policy action=reroute 2>/dev/null | grep -B5 -A5 "$pod_ip" || true)
+    if [ -n "$reroute_full" ]; then
+        local nexthops=$(echo "$reroute_full" | grep -i "nexthop" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' || true)
+        if [ -n "$nexthops" ]; then
+            echo "Reroute policy nexthop(s): $nexthops"
+            echo ""
+            echo "Resolving nexthop(s) to node names via logical router ports..."
+            show_command "ovn-nbctl --no-leader-only find logical_router_port"
+            local all_lrps=$($CONTAINER_ENGINE exec $CONTAINER ovn-nbctl --no-leader-only find logical_router_port 2>/dev/null || true)
+            for nexthop_ip in $nexthops; do
+                local lrp_match=$(echo "$all_lrps" | grep -B10 "$nexthop_ip" || true)
+                if [ -n "$lrp_match" ]; then
+                    local lrp_name=$(echo "$lrp_match" | grep "^name" | tail -1 | awk '{print $3}' | tr -d '"')
+                    echo "Nexthop $nexthop_ip matches logical router port: $lrp_name"
+                    if [[ "$lrp_name" == rtos-* ]]; then
+                        local resolved_node="${lrp_name#rtos-}"
+                        echo "  -> EgressIP reroute targets node: $resolved_node"
+                    elif [[ "$lrp_name" == rtoj-GR_* ]]; then
+                        local resolved_node="${lrp_name#rtoj-GR_}"
+                        echo "  -> EgressIP reroute targets node: $resolved_node"
+                    fi
+                else
+                    echo "Nexthop $nexthop_ip: no matching logical router port found"
+                    echo "Checking southbound chassis for nexthop $nexthop_ip..."
+                    show_command "ovn-sbctl --no-leader-only list chassis | grep -B5 -A5 $nexthop_ip"
+                    $CONTAINER_ENGINE exec $CONTAINER ovn-sbctl --no-leader-only list chassis 2>/dev/null | grep -B5 -A5 "$nexthop_ip" || echo "  No chassis match for $nexthop_ip"
+                fi
+            done
+        else
+            echo "Reroute policies found but could not extract nexthop IPs"
+            echo "$reroute_full"
+        fi
+    else
+        echo "No reroute policies found for $pod_ip (no nexthop resolution needed)"
+    fi
 }
 
 perform_flow_analysis() {
