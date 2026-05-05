@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
-source ../utils
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/utils"
 
 description() {
     echo "Run ovn-kubernetes container with ovn db restored from a given file"

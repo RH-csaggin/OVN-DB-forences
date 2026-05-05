@@ -1,7 +1,8 @@
 
 #!/bin/bash
 set -euo pipefail
-source ../utils
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/utils"
 
 description() {
     echo "Run multiple ovn-kubernetes containers with ovn dbs restored from files in a given directory"

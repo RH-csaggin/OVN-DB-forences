@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
-source ../utils
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/utils"
 
 USAGE="$(basename "$0")"
 
@@ -50,8 +51,8 @@ Examples:
 
 clean_up () {
   echo "CLEANUP"
-  $CONTAINER_ENGINE stop $CONTAINER 2>/dev/null || true
-  $CONTAINER_ENGINE rm $CONTAINER 2>/dev/null || true
+  $CONTAINER_ENGINE stop $CONTAINER >/dev/null 2>&1 || true
+  $CONTAINER_ENGINE rm $CONTAINER >/dev/null 2>&1 || true
   exit 0
 }
 
@@ -599,17 +600,11 @@ resolve_pod_name_to_ip() {
 
         # Search for the pod name in logical switch ports
         # Pod names are typically stored in external_ids like namespace/podname
-        local search_result=$($CONTAINER_ENGINE exec $CONTAINER ovn-nbctl --no-leader-only find logical_switch_port external_ids:pod=true 2>/dev/null | grep -B20 -A5 "$pod_name" || true)
-
-        if [ -n "$search_result" ]; then
-            # Try to extract IP from the result
-            pod_ip=$(echo "$search_result" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
-
-            if [ -z "$pod_ip" ]; then
-                # Try alternative formats
-                pod_ip=$(echo "$search_result" | grep "addresses" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
-            fi
-        fi
+        # Use awk paragraph mode to isolate the record matching the pod name,
+        # so we only extract the IP from the correct LSP entry
+        pod_ip=$($CONTAINER_ENGINE exec $CONTAINER ovn-nbctl --no-leader-only find logical_switch_port external_ids:pod=true 2>/dev/null | \
+            awk -v search="$pod_name" 'BEGIN{RS=""} $0 ~ search' | \
+            grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
 
         if [ -z "$pod_ip" ]; then
             echo "ERROR: Could not resolve pod name '$pod_name' to an IP address" >&2
